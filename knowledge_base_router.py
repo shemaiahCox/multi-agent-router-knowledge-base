@@ -1,8 +1,3 @@
-# ---- Knowledge Base Router ----
-# Route a question to GitHub, Notion, and Slack specialists, then merge their answers.
-
-# -- Imports --
-
 import operator
 from typing import Annotated, Literal, TypedDict
 from pydantic import BaseModel, Field
@@ -13,78 +8,92 @@ from langchain.tools import tool
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
-# ---- State ----
-# RouterState is the graph's shared memory. Each specialist returns one AgentOutput,
-# and the operator.add reducer appends those results instead of overwriting them.
+# 1. Define State Schemas
+
 
 class AgentInput(TypedDict):
     """Simple input state for each subagent."""
+
     query: str
+
 
 class AgentOutput(TypedDict):
     """Output from each subagent."""
+
     source: str
     result: str
 
+
 class Classification(TypedDict):
     """A single routing decision: which agent to call with what query."""
+
     source: Literal["github", "notion", "slack"]
     query: str
+
 
 class RouterState(TypedDict):
     query: str
     classifications: list[Classification]
-    results: Annotated[list[AgentOutput], operator.add]  # Reducer collects parallel results
+    results: Annotated[
+        list[AgentOutput], operator.add
+    ]  # Reducer collects parallel results
     final_answer: str
+
 
 class ClassificationResult(BaseModel):
     """Result of classifying a user query into agent-specific sub-questions."""
+
     classifications: list[Classification] = Field(
         description="List of agents to invoke with their targeted sub-questions"
     )
 
-# ---- Specialist tools ----
-# Stand-ins for live GitHub, Notion, and Slack searches. Each returns a fixed
-# snippet so the graph can run without API credentials.
+
+# 2. Define Tools for Each Vertical
+
 
 @tool
 def search_code(query: str, repo: str = "main") -> str:
     """Search code in GitHub repositories."""
     return f"Found code matching '{query}' in {repo}: authentication middleware in src/auth.py"
 
+
 @tool
 def search_issues(query: str) -> str:
     """Search GitHub issues and pull requests."""
     return f"Found 3 issues matching '{query}': #142 (API auth docs), #89 (OAuth flow), #203 (token refresh)"
+
 
 @tool
 def search_prs(query: str) -> str:
     """Search pull requests for implementation details."""
     return "PR #156 added JWT authentication, PR #178 updated OAuth scopes"
 
+
 @tool
 def search_notion(query: str) -> str:
     """Search Notion workspace for documentation."""
     return "Found documentation: 'API Authentication Guide' - covers OAuth2 flow, API keys, and JWT tokens"
+
 
 @tool
 def get_page(page_id: str) -> str:
     """Get a specific Notion page by ID."""
     return "Page content: Step-by-step authentication setup instructions"
 
+
 @tool
 def search_slack(query: str) -> str:
     """Search Slack messages and threads."""
     return "Found discussion in #engineering: 'Use Bearer tokens for API auth, see docs for refresh flow'"
+
 
 @tool
 def get_thread(thread_id: str) -> str:
     """Get a specific Slack thread."""
     return "Thread discusses best practices for API key rotation"
 
-# ---- Models and agents ----
-# The smaller router model only classifies and synthesizes. Specialists use the
-# larger model and can call only the tools for their own source.
+
+# 3. Initialize Models and Specialized Agents
 
 model = init_chat_model("openai:gpt-5.5")
 router_llm = init_chat_model("openai:gpt-5.4-mini")
@@ -119,85 +128,100 @@ slack_agent = create_agent(
     ),
 )
 
-# ---- Graph nodes ----
-# classify picks the sources, each query_* node runs one specialist, and
-# synthesize writes the final answer once every chosen branch has finished.
+
+# 4. Define Router Workflow Nodes
+
 
 def classify_query(state: RouterState) -> dict:
     """Classify query and determine which agents to invoke."""
-    # Structured output keeps the routing decision as Classification objects.
     structured_llm = router_llm.with_structured_output(ClassificationResult)
-    result = structured_llm.invoke([
-        {
-            "role": "system",
-            "content": """Analyze this query and determine which knowledge bases to consult. For each relevant source, generate a targeted sub-question optimized for that source. Available sources:
+    result = structured_llm.invoke(
+        [
+            {
+                "role": "system",
+                "content": """Analyze this query and determine which knowledge bases to consult. For each relevant source, generate a targeted sub-question optimized for that source. Available sources:
 - github: Code, API references, implementation details, issues, pull requests
 - notion: Internal documentation, processes, policies, team wikis
 - slack: Team discussions, informal knowledge sharing, recent conversations
-Return ONLY the sources that are relevant to the query."""
-        },
-        {"role": "user", "content": state["query"]}
-    ])
+Return ONLY the sources that are relevant to the query.""",
+            },
+            {"role": "user", "content": state["query"]},
+        ]
+    )
     return {"classifications": result.classifications}
+
 
 def route_to_agents(state: RouterState) -> list[Send]:
     """Fan out to agents based on classifications."""
-    # One Send per classification starts that specialist in parallel.
-    # Sources the classifier omitted are not called.
     return [
-        Send(c["source"], {"query": c["query"]}) 
+        Send(c["source"], {"query": c["query"]})
         for c in state["classifications"]
     ]
 
+
 def query_github(state: AgentInput) -> dict:
     """Query the GitHub agent."""
-    result = github_agent.invoke({
-        "messages": [{"role": "user", "content": state["query"]}]
-    })
-    # The last message is the agent's final reply. Wrap it so the reducer can append it.
-    return {"results": [{"source": "github", "result": result["messages"][-1].content}]}
+    result = github_agent.invoke(
+        {"messages": [{"role": "user", "content": state["query"]}]}
+    )
+    return {
+        "results": [
+            {"source": "github", "result": result["messages"][-1].content}
+        ]
+    }
+
 
 def query_notion(state: AgentInput) -> dict:
     """Query the Notion agent."""
-    result = notion_agent.invoke({
-        "messages": [{"role": "user", "content": state["query"]}]
-    })
-    return {"results": [{"source": "notion", "result": result["messages"][-1].content}]}
+    result = notion_agent.invoke(
+        {"messages": [{"role": "user", "content": state["query"]}]}
+    )
+    return {
+        "results": [
+            {"source": "notion", "result": result["messages"][-1].content}
+        ]
+    }
+
 
 def query_slack(state: AgentInput) -> dict:
     """Query the Slack agent."""
-    result = slack_agent.invoke({
-        "messages": [{"role": "user", "content": state["query"]}]
-    })
-    return {"results": [{"source": "slack", "result": result["messages"][-1].content}]}
+    result = slack_agent.invoke(
+        {"messages": [{"role": "user", "content": state["query"]}]}
+    )
+    return {
+        "results": [
+            {"source": "slack", "result": result["messages"][-1].content}
+        ]
+    }
+
 
 def synthesize_results(state: RouterState) -> dict:
     """Combine results from all agents into a coherent answer."""
     if not state["results"]:
         return {"final_answer": "No results found from any knowledge source."}
-    
+
     formatted = [
-        f"**From {r['source'].title()}:**\n{r['result']}" 
+        f"**From {r['source'].title()}:**\n{r['result']}"
         for r in state["results"]
     ]
-    
-    synthesis_response = router_llm.invoke([
-        {
-            "role": "system",
-            "content": f"""Synthesize these search results to answer the original question: "{state['query']}"
+
+    synthesis_response = router_llm.invoke(
+        [
+            {
+                "role": "system",
+                "content": f"""Synthesize these search results to answer the original question: "{state['query']}"
 - Combine information from multiple sources without redundancy
 - Highlight the most relevant and actionable information
 - Note any discrepancies between sources
-- Keep the response concise and well-organized"""
-        },
-        {"role": "user", "content": "\n\n".join(formatted)}
-    ])
+- Keep the response concise and well-organized""",
+            },
+            {"role": "user", "content": "\n\n".join(formatted)},
+        ]
+    )
     return {"final_answer": synthesis_response.content}
 
-# ---- Compile the graph ----
-# classify fans out to whichever specialists were chosen, then every branch
-# joins at synthesize. The conditional edge lists every possible destination
-# so LangGraph can wire them even when a run skips some.
+
+# 5. Compile the Workflow Graph
 
 workflow = (
     StateGraph(RouterState)
@@ -207,7 +231,9 @@ workflow = (
     .add_node("slack", query_slack)
     .add_node("synthesize", synthesize_results)
     .add_edge(START, "classify")
-    .add_conditional_edges("classify", route_to_agents, ["github", "notion", "slack"])
+    .add_conditional_edges(
+        "classify", route_to_agents, ["github", "notion", "slack"]
+    )
     .add_edge("github", "synthesize")
     .add_edge("notion", "synthesize")
     .add_edge("slack", "synthesize")
@@ -215,12 +241,12 @@ workflow = (
     .compile()
 )
 
-# ---- Example run ----
-# Invoke the compiled graph with one question and print the route plus the answer.
+
+# 6. Execution Example
 
 if __name__ == "__main__":
     result = workflow.invoke({"query": "How do I authenticate API requests?"})
-    
+
     print("Original query:", result["query"])
     print("\nClassifications:")
     for c in result["classifications"]:
