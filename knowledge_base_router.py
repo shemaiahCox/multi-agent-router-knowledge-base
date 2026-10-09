@@ -1,3 +1,8 @@
+# ---- Knowledge Base Router ----
+# Route a question to GitHub, Notion, and Slack specialists, then merge their answers.
+
+# -- Imports --
+
 import operator
 from typing import Annotated, Literal, TypedDict
 from pydantic import BaseModel, Field
@@ -8,7 +13,9 @@ from langchain.tools import tool
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
-# 1. State Definitions
+# ---- State ----
+# RouterState is the graph's shared memory. Each specialist returns one AgentOutput,
+# and the operator.add reducer appends those results instead of overwriting them.
 
 class AgentInput(TypedDict):
     """Simple input state for each subagent."""
@@ -36,7 +43,9 @@ class ClassificationResult(BaseModel):
         description="List of agents to invoke with their targeted sub-questions"
     )
 
-# 2. Tools for Each Vertical
+# ---- Specialist tools ----
+# Stand-ins for live GitHub, Notion, and Slack searches. Each returns a fixed
+# snippet so the graph can run without API credentials.
 
 @tool
 def search_code(query: str, repo: str = "main") -> str:
@@ -73,7 +82,9 @@ def get_thread(thread_id: str) -> str:
     """Get a specific Slack thread."""
     return "Thread discusses best practices for API key rotation"
 
-# 3. Models and Agents Initialization
+# ---- Models and agents ----
+# The smaller router model only classifies and synthesizes. Specialists use the
+# larger model and can call only the tools for their own source.
 
 model = init_chat_model("openai:gpt-5.5")
 router_llm = init_chat_model("openai:gpt-5.4-mini")
@@ -108,10 +119,13 @@ slack_agent = create_agent(
     ),
 )
 
-# 4. Workflow Node Functions
+# ---- Graph nodes ----
+# classify picks the sources, each query_* node runs one specialist, and
+# synthesize writes the final answer once every chosen branch has finished.
 
 def classify_query(state: RouterState) -> dict:
     """Classify query and determine which agents to invoke."""
+    # Structured output keeps the routing decision as Classification objects.
     structured_llm = router_llm.with_structured_output(ClassificationResult)
     result = structured_llm.invoke([
         {
@@ -128,6 +142,8 @@ Return ONLY the sources that are relevant to the query."""
 
 def route_to_agents(state: RouterState) -> list[Send]:
     """Fan out to agents based on classifications."""
+    # One Send per classification starts that specialist in parallel.
+    # Sources the classifier omitted are not called.
     return [
         Send(c["source"], {"query": c["query"]}) 
         for c in state["classifications"]
@@ -138,6 +154,7 @@ def query_github(state: AgentInput) -> dict:
     result = github_agent.invoke({
         "messages": [{"role": "user", "content": state["query"]}]
     })
+    # The last message is the agent's final reply. Wrap it so the reducer can append it.
     return {"results": [{"source": "github", "result": result["messages"][-1].content}]}
 
 def query_notion(state: AgentInput) -> dict:
@@ -177,7 +194,10 @@ def synthesize_results(state: RouterState) -> dict:
     ])
     return {"final_answer": synthesis_response.content}
 
-# 5. Compile the StateGraph Workflow
+# ---- Compile the graph ----
+# classify fans out to whichever specialists were chosen, then every branch
+# joins at synthesize. The conditional edge lists every possible destination
+# so LangGraph can wire them even when a run skips some.
 
 workflow = (
     StateGraph(RouterState)
@@ -195,7 +215,8 @@ workflow = (
     .compile()
 )
 
-# 6. Execution Example
+# ---- Example run ----
+# Invoke the compiled graph with one question and print the route plus the answer.
 
 if __name__ == "__main__":
     result = workflow.invoke({"query": "How do I authenticate API requests?"})
